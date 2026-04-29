@@ -1,0 +1,8 @@
+/target
+config.toml
+.ai-factory
+.idea
+.claude
+.codex
+.ai-factory.json
+certs

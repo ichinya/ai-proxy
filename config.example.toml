@@ -1,0 +1,79 @@
+[proxy]
+listen_addr = "127.0.0.1:8080"
+anthropic_upstream_url = "https://api.anthropic.com"
+codex_upstream_url = "https://api.openai.com"
+codex_subscription_url = "https://chatgpt.com/backend-api/codex/responses"
+codex_subscription_routing_enabled = true
+rate_limit_enabled = true
+max_body_size = 10485760       # 10 MB
+connect_timeout_secs = 10
+request_timeout_secs = 0       # 0 disables total request timeout for streaming/SSE
+rate_limit_rps = 50
+mitm_enabled = true
+mitm_ca_cert_path = "certs/ai-proxy-ca.pem"       # auto-created with key on first MITM start
+mitm_ca_key_path = "certs/ai-proxy-ca-key.pem"    # private key; keep local and do not trust/install
+mitm_cert_cache_size = 256
+mitm_excluded_hosts = []
+websocket_mode = "inspect"                       # reject | passthrough | inspect
+
+[redaction]
+strategy = "partial"
+prefix_len = 3
+suffix_len = 3
+mask = "***...***"
+
+[scanner]
+enabled = false
+scan_scope = "body"
+header_whitelist = [
+    "x-api-key",
+    "authorization",
+    "cookie",
+    "anthropic-version",
+    "anthropic-beta",
+]
+
+[scanner.entropy]
+enabled = true
+threshold = 4.5
+min_length = 20
+max_length = 256
+keywords = ["key", "secret", "token", "password", "passwd", "credential", "auth"]
+keyword_proximity = 50
+
+[scanner.structural]
+enabled = true
+detect_jwt = true
+detect_connection_strings = true
+detect_env_patterns = true
+
+[scanner.regex]
+enabled = true
+
+[[scanner.regex.patterns]]
+name = "aws_access_key"
+pattern = "AKIA[0-9A-Z]{16}"
+
+[[scanner.regex.patterns]]
+name = "aws_secret_key"
+pattern = "(?i)aws_secret_access_key\\s*[=:]\\s*[A-Za-z0-9/+=]{40}"
+
+[[scanner.regex.patterns]]
+name = "github_token"
+pattern = "gh[pousr]_[A-Za-z0-9_]{36,}"
+
+[[scanner.regex.patterns]]
+name = "anthropic_api_key"
+pattern = "sk-ant-[A-Za-z0-9-]{20,}"
+
+[[scanner.regex.patterns]]
+name = "openai_api_key"
+pattern = "sk-[A-Za-z0-9]{20,}"
+
+[[scanner.regex.patterns]]
+name = "generic_secret_assignment"
+pattern = "(?i)(password|secret|token|api_key|apikey|private_key)\\s*[=:]\\s*[\"'][^\"']{8,}[\"']"
+
+[[scanner.regex.patterns]]
+name = "private_key_block"
+pattern = "-----BEGIN (RSA |EC |DSA |OPENSSH )?PRIVATE KEY-----"
