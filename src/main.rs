@@ -14,13 +14,17 @@ use std::num::NonZeroU32;
 use tracing::info;
 
 use ai_proxy::config::Config;
+use ai_proxy::dashboard::serve_dashboard;
 use ai_proxy::middleware::ScanPipeline;
 use ai_proxy::middleware::entropy_scanner::EntropyScanner;
+use ai_proxy::middleware::model_scanner::ModelScanner;
+use ai_proxy::middleware::privacy_filter_scanner::PrivacyFilterScanner;
 use ai_proxy::middleware::regex_scanner::RegexScanner;
 use ai_proxy::middleware::structural_scanner::StructuralScanner;
 use ai_proxy::mitm::MitmAuthority;
 use ai_proxy::proxy::{AppState, proxy_handler};
 use ai_proxy::redactor::Redactor;
+use ai_proxy::telemetry_store::TelemetryStore;
 
 type GlobalRateLimiter = Arc<
     RateLimiter<
@@ -53,19 +57,43 @@ async fn main() {
 
     // Build scan pipeline
     let mut pipeline = ScanPipeline::new();
+    let capture_redaction_enabled = config.dashboard.enabled
+        && config.dashboard.capture.redact_before_store
+        && (config.dashboard.capture.prompts || config.dashboard.capture.responses);
+    let build_scan_pipeline = config.scanner.enabled || capture_redaction_enabled;
 
-    if config.scanner.enabled && config.scanner.regex.enabled {
+    if build_scan_pipeline && config.scanner.regex.enabled {
         pipeline.add_scanner(Box::new(RegexScanner::new(&config.scanner.regex)));
     }
-    if config.scanner.enabled && config.scanner.entropy.enabled {
+    if build_scan_pipeline && config.scanner.entropy.enabled {
         pipeline.add_scanner(Box::new(EntropyScanner::new(&config.scanner.entropy)));
     }
-    if config.scanner.enabled && config.scanner.structural.enabled {
+    if build_scan_pipeline && config.scanner.structural.enabled {
         pipeline.add_scanner(Box::new(StructuralScanner::new(&config.scanner.structural)));
+    }
+    if build_scan_pipeline && config.scanner.model.enabled {
+        if config.scanner.model.mode == "direct" {
+            let mut direct_pipeline = ScanPipeline::new();
+            direct_pipeline.add_scanner(Box::new(ModelScanner::new(&config.scanner.model)));
+            pipeline = direct_pipeline;
+        } else {
+            pipeline.add_scanner(Box::new(ModelScanner::new(&config.scanner.model)));
+        }
+    }
+    if build_scan_pipeline && config.scanner.privacy_filter.enabled {
+        pipeline.add_scanner(Box::new(PrivacyFilterScanner::new(
+            &config.scanner.privacy_filter,
+        )));
     }
 
     // Build redactor
     let redactor = Redactor::new(&config.redaction);
+    info!(
+        strategy = %config.redaction.strategy,
+        response_restore_enabled = config.redaction.response_restore_enabled,
+        restorable_categories = ?config.redaction.restorable_categories,
+        "Redaction policy configured"
+    );
 
     // Build HTTP client with timeouts
     let mut http_client_builder = reqwest::Client::builder()
@@ -90,6 +118,27 @@ async fn main() {
         None
     };
 
+    let telemetry_store = if config.dashboard.enabled {
+        info!(
+            listen_addr = %config.dashboard.listen_addr,
+            sqlite_path = %config.dashboard.sqlite_path.display(),
+            retention_hours = config.dashboard.retention_hours,
+            "Telemetry persistence enabled for dashboard"
+        );
+        Some(Arc::new(
+            TelemetryStore::open(
+                &config.dashboard.sqlite_path,
+                config.dashboard.retention_hours,
+            )
+            .await
+            .expect("Failed to initialize telemetry SQLite database"),
+        ))
+    } else {
+        info!("Telemetry persistence disabled because dashboard is disabled");
+        None
+    };
+    let dashboard_store = telemetry_store.clone();
+
     // Create shared state
     let state = Arc::new(AppState {
         config: config.clone(),
@@ -97,7 +146,17 @@ async fn main() {
         redactor,
         http_client,
         mitm_authority,
+        telemetry_store,
     });
+
+    if let Some(store) = dashboard_store {
+        let dashboard_config = config.dashboard.clone();
+        tokio::spawn(async move {
+            if let Err(error) = serve_dashboard(dashboard_config, store).await {
+                tracing::error!(error = %error, "Dashboard server stopped with error");
+            }
+        });
+    }
 
     let mut app = Router::new()
         .route("/{*path}", any(proxy_handler))

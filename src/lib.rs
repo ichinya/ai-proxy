@@ -1,6 +1,10 @@
 pub mod config;
+pub mod dashboard;
 pub mod logging;
 pub mod middleware;
 pub mod mitm;
 pub mod proxy;
+pub mod redaction_context;
 pub mod redactor;
+pub mod telemetry;
+pub mod telemetry_store;

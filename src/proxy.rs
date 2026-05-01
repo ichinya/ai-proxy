@@ -6,6 +6,7 @@ use axum::{
 };
 use bytes::Bytes;
 use flate2::read::GzDecoder;
+use futures_util::Stream;
 use futures_util::{SinkExt, StreamExt};
 use hyper::body::Incoming;
 use hyper::server::conn::http1;
@@ -15,6 +16,7 @@ use hyper_util::rt::TokioIo;
 use serde_json::Value;
 use std::convert::Infallible;
 use std::io::Read;
+use std::pin::Pin;
 use std::sync::Arc;
 use tokio::io::copy_bidirectional;
 use tokio::net::TcpStream;
@@ -34,7 +36,14 @@ use crate::config::Config;
 use crate::logging::log_redaction;
 use crate::middleware::ScanPipeline;
 use crate::mitm::{MitmAuthority, normalize_connect_host};
+use crate::redaction_context::{RedactionContext, StreamingRestore};
 use crate::redactor::Redactor;
+use crate::telemetry::{
+    ContentCaptureRecord, RequestRecord, RequestTelemetryContext, ResponseTelemetryCollector,
+    extract_model_from_json, extract_tool_events_from_json, extract_websocket_text_telemetry,
+    next_request_id, now_ms,
+};
+use crate::telemetry_store::TelemetryStore;
 
 /// Shared application state passed to the proxy handler.
 pub struct AppState {
@@ -43,6 +52,7 @@ pub struct AppState {
     pub redactor: Redactor,
     pub http_client: reqwest::Client,
     pub mitm_authority: Option<Arc<MitmAuthority>>,
+    pub telemetry_store: Option<Arc<TelemetryStore>>,
 }
 
 /// Headers that are not safe to forward unchanged through this proxy.
@@ -65,6 +75,7 @@ const SEC_WEBSOCKET_VERSION: &str = "sec-websocket-version";
 const SEC_WEBSOCKET_EXTENSIONS: &str = "sec-websocket-extensions";
 
 type UpstreamWebSocket = WebSocketStream<MaybeTlsStream<TcpStream>>;
+type ResponseByteStream = Pin<Box<dyn Stream<Item = Result<Bytes, std::io::Error>> + Send>>;
 
 /// Catch-all proxy handler: receives any request, scans & redacts the body,
 /// forwards to upstream, and streams the response back.
@@ -75,6 +86,7 @@ pub async fn proxy_handler(
     let method = req.method().clone();
     let uri = req.uri().clone();
     let headers = req.headers().clone();
+    let request_id = next_request_id();
 
     if method == Method::CONNECT {
         return handle_connect(state, req).await;
@@ -83,6 +95,7 @@ pub async fn proxy_handler(
     let route = upstream_route(&state, &uri, &headers);
 
     info!(
+        request_id = %request_id,
         method = %method,
         path = %uri.path(),
         upstream = %route.base_url,
@@ -104,6 +117,7 @@ pub async fn proxy_handler(
         route.is_codex_responses || state.config.scanner.enabled,
         route.needs_codex_subscription_payload_normalization,
         "reverse",
+        request_id,
     )
     .await
 }
@@ -168,6 +182,7 @@ async fn forward_request(
     allow_normalization: bool,
     force_codex_store_false: bool,
     mode: &'static str,
+    request_id: String,
 ) -> Result<Response, StatusCode> {
     let body_bytes = match axum::body::to_bytes(body, state.config.proxy.max_body_size).await {
         Ok(bytes) => bytes,
@@ -177,8 +192,9 @@ async fn forward_request(
         }
     };
 
-    let processed_body = match process_request_body(
+    let mut processed_body = match process_request_body(
         state,
+        &request_id,
         &headers,
         &body_bytes,
         allow_normalization,
@@ -188,7 +204,40 @@ async fn forward_request(
         Err(status) => return Err(status),
     };
 
+    let model = extract_model_from_json(&processed_body.telemetry_bytes);
+    let telemetry_context = RequestTelemetryContext {
+        request_id: request_id.clone(),
+        started_at_ms: now_ms(),
+        method: method.to_string(),
+        path: upstream_url.clone(),
+        mode: mode.to_string(),
+        upstream: upstream_url.clone(),
+        model,
+    };
+    persist_request_start(state, &telemetry_context).await;
+    persist_request_tool_events(
+        state,
+        &request_id,
+        &processed_body.telemetry_bytes,
+        "request",
+    )
+    .await;
+    persist_content_capture_from_bytes(
+        state,
+        &request_id,
+        "request",
+        "http",
+        headers
+            .get("content-type")
+            .and_then(|value| value.to_str().ok()),
+        &processed_body.bytes,
+        processed_body.bytes.len(),
+        false,
+    )
+    .await;
+
     debug!(
+        request_id = %request_id,
         mode,
         original_size = body_bytes.len(),
         forwarded_size = processed_body.bytes.len(),
@@ -197,8 +246,14 @@ async fn forward_request(
 
     let (forwarded_headers, final_upstream_url) =
         if state.config.scanner.enabled && state.config.scanner.scan_scope == "full" {
-            let scanned_headers = scan_and_redact_headers(state, &headers);
-            let redacted_url = scan_and_redact_query_params(state, &upstream_url);
+            let scanned_headers =
+                scan_and_redact_headers(state, &headers, &request_id, &mut processed_body.context);
+            let redacted_url = scan_and_redact_query_params(
+                state,
+                &upstream_url,
+                &request_id,
+                &mut processed_body.context,
+            );
             (scanned_headers, redacted_url)
         } else {
             (headers.clone(), upstream_url)
@@ -221,19 +276,39 @@ async fn forward_request(
     let upstream_resp = match upstream_req.send().await {
         Ok(resp) => resp,
         Err(e) => {
-            error!(mode, error = %e, "Failed to connect to upstream");
+            error!(request_id = %request_id, mode, error = %e, "Failed to connect to upstream");
+            persist_request_finish(
+                state,
+                &request_id,
+                None,
+                Some("failed to connect to upstream"),
+            )
+            .await;
             return Err(StatusCode::BAD_GATEWAY);
         }
     };
 
-    response_from_upstream(upstream_resp, mode)
+    response_from_upstream(
+        upstream_resp,
+        mode,
+        state.clone(),
+        telemetry_context,
+        processed_body.context,
+    )
+    .await
 }
 
-fn response_from_upstream(
+async fn response_from_upstream(
     upstream_resp: reqwest::Response,
     mode: &'static str,
+    state: Arc<AppState>,
+    telemetry_context: RequestTelemetryContext,
+    redaction_context: RedactionContext,
 ) -> Result<Response, StatusCode> {
+    let request_id = telemetry_context.request_id.clone();
+    let telemetry_store = state.telemetry_store.clone();
     info!(
+        request_id = %request_id,
         mode,
         status = upstream_resp.status().as_u16(),
         "Upstream response received"
@@ -241,8 +316,24 @@ fn response_from_upstream(
 
     let status = axum::http::StatusCode::from_u16(upstream_resp.status().as_u16())
         .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+    if let Some(store) = telemetry_store.as_ref()
+        && let Err(error) = store
+            .finish_request(&request_id, now_ms(), Some(status.as_u16()), None)
+            .await
+    {
+        warn!(
+            request_id = %request_id,
+            error = %error,
+            "Failed to finish telemetry request"
+        );
+    }
 
     let mut response_headers = HeaderMap::new();
+    let response_content_type = upstream_resp
+        .headers()
+        .get("content-type")
+        .and_then(|value| value.to_str().ok())
+        .map(ToOwned::to_owned);
     for (name, value) in upstream_resp.headers() {
         if let (Ok(n), Ok(v)) = (
             HeaderName::from_bytes(name.as_ref()),
@@ -256,19 +347,580 @@ fn response_from_upstream(
         }
     }
 
-    debug!(mode, "Streaming upstream response body");
+    debug!(request_id = %request_id, mode, "Streaming upstream response body");
+    let stream_request_id = request_id.clone();
     let stream = upstream_resp.bytes_stream().map(move |chunk| {
+        let stream_request_id = stream_request_id.clone();
         chunk.map_err(move |e| {
-            warn!(mode, error = %e, "Error reading upstream response chunk");
+            warn!(request_id = %stream_request_id, mode, error = %e, "Error reading upstream response chunk");
             std::io::Error::other(e)
         })
     });
+    let stream: ResponseByteStream = Box::pin(stream);
+    let stream: ResponseByteStream = if stateful_restore_enabled(&redaction_context) {
+        debug!(
+            request_id = %request_id,
+            mode,
+            placeholder_count_empty = redaction_context.is_empty(),
+            "Response placeholder restoration enabled"
+        );
+        Box::pin(restore_response_stream(stream, redaction_context))
+    } else {
+        debug!(
+            request_id = %request_id,
+            mode,
+            "Response placeholder restoration disabled"
+        );
+        stream
+    };
+    let stream = telemetry_stream(stream, state, telemetry_context, response_content_type);
 
     let mut response = Response::new(Body::from_stream(stream));
     *response.status_mut() = status;
     *response.headers_mut() = response_headers;
 
     Ok(response)
+}
+
+fn stateful_restore_enabled(context: &RedactionContext) -> bool {
+    !context.is_empty()
+}
+
+fn restore_response_stream(
+    stream: ResponseByteStream,
+    context: RedactionContext,
+) -> impl Stream<Item = Result<Bytes, std::io::Error>> + Send {
+    futures_util::stream::unfold(
+        (stream, Some(StreamingRestore::new(context)), false),
+        |(mut stream, mut restore, finished)| async move {
+            if finished {
+                return None;
+            }
+
+            match stream.next().await {
+                Some(Ok(bytes)) => {
+                    let Some(adapter) = restore.as_mut() else {
+                        return Some((Ok(bytes), (stream, restore, false)));
+                    };
+                    let report = adapter.push(bytes);
+                    if !report.counts_by_category.is_empty() {
+                        debug!(
+                            counts_by_category = ?report.counts_by_category,
+                            "Restored placeholders in response chunk"
+                        );
+                    }
+                    Some((Ok(report.bytes), (stream, restore, false)))
+                }
+                Some(Err(error)) => Some((Err(error), (stream, restore, false))),
+                None => {
+                    if let Some(adapter) = restore.take()
+                        && let Some(report) = adapter.finish()
+                    {
+                        if !report.counts_by_category.is_empty() {
+                            debug!(
+                                counts_by_category = ?report.counts_by_category,
+                                "Restored placeholders in final response chunk"
+                            );
+                        }
+                        return Some((Ok(report.bytes), (stream, restore, true)));
+                    }
+                    None
+                }
+            }
+        },
+    )
+}
+
+fn telemetry_stream(
+    stream: ResponseByteStream,
+    state: Arc<AppState>,
+    context: RequestTelemetryContext,
+    content_type: Option<String>,
+) -> impl Stream<Item = Result<Bytes, std::io::Error>> + Send {
+    let telemetry_store = state.telemetry_store.clone();
+    let collector = telemetry_store.as_ref().map(|_| {
+        ResponseTelemetryCollector::new(
+            context.request_id.clone(),
+            context.model.clone(),
+            context.upstream.clone(),
+            "response".to_string(),
+        )
+    });
+    let capture = if state.telemetry_store.is_some() && state.config.dashboard.capture.responses {
+        Some(CapturePreviewBuffer::new(
+            state.config.dashboard.capture.max_body_bytes,
+        ))
+    } else {
+        None
+    };
+
+    futures_util::stream::unfold(
+        (stream, collector, capture, state, context, content_type),
+        |(mut stream, mut collector, mut capture, state, context, content_type)| async move {
+            match stream.next().await {
+                Some(Ok(bytes)) => {
+                    if let Some(collector) = collector.as_mut() {
+                        collector.observe_chunk(&bytes);
+                    }
+                    if let Some(capture) = capture.as_mut() {
+                        capture.observe(&bytes);
+                    }
+                    Some((
+                        Ok(bytes),
+                        (stream, collector, capture, state, context, content_type),
+                    ))
+                }
+                Some(Err(error)) => Some((
+                    Err(error),
+                    (stream, collector, capture, state, context, content_type),
+                )),
+                None => {
+                    if let (Some(store), Some(collector)) =
+                        (state.telemetry_store.as_ref(), collector)
+                    {
+                        let (usage_records, tool_events) = collector.finalize();
+                        persist_response_telemetry_records(
+                            store,
+                            usage_records,
+                            tool_events,
+                            "response",
+                        )
+                        .await;
+                    }
+                    if let Some(capture) = capture {
+                        persist_content_capture_from_bytes(
+                            &state,
+                            &context.request_id,
+                            "response",
+                            "http",
+                            content_type.as_deref(),
+                            capture.bytes(),
+                            capture.observed_bytes(),
+                            capture.truncated(),
+                        )
+                        .await;
+                    }
+                    None
+                }
+            }
+        },
+    )
+}
+
+async fn persist_response_telemetry_records(
+    store: &TelemetryStore,
+    usage_records: Vec<crate::telemetry::TokenUsageRecord>,
+    tool_events: Vec<crate::telemetry::ToolEventRecord>,
+    source: &str,
+) {
+    for usage in usage_records {
+        info!(
+            request_id = %usage.request_id,
+            model = ?usage.model,
+            input_tokens = ?usage.input_tokens,
+            output_tokens = ?usage.output_tokens,
+            total_tokens = ?usage.total_tokens,
+            upstream = %usage.upstream,
+            source,
+            "Captured token usage telemetry"
+        );
+        if let Err(error) = store.insert_usage(&usage).await {
+            warn!(
+                request_id = %usage.request_id,
+                error = %error,
+                source,
+                "Failed to persist usage telemetry"
+            );
+        }
+    }
+
+    for event in tool_events {
+        if let Err(error) = store.insert_tool_event(&event).await {
+            warn!(
+                request_id = %event.request_id,
+                error = %error,
+                source,
+                "Failed to persist tool telemetry"
+            );
+        }
+    }
+}
+
+async fn persist_request_start(state: &AppState, context: &RequestTelemetryContext) {
+    let Some(store) = state.telemetry_store.as_ref() else {
+        debug!(
+            request_id = %context.request_id,
+            "Telemetry store disabled; skipping request persistence"
+        );
+        return;
+    };
+
+    let record = RequestRecord {
+        request_id: context.request_id.clone(),
+        started_at_ms: context.started_at_ms,
+        completed_at_ms: None,
+        method: context.method.clone(),
+        path: context.path.clone(),
+        mode: context.mode.clone(),
+        upstream: context.upstream.clone(),
+        model: context.model.clone(),
+        status_code: None,
+        error: None,
+    };
+
+    if let Err(error) = store.insert_request(&record).await {
+        warn!(
+            request_id = %context.request_id,
+            error = %error,
+            "Failed to persist request telemetry"
+        );
+    }
+}
+
+async fn persist_request_finish(
+    state: &AppState,
+    request_id: &str,
+    status_code: Option<u16>,
+    error_message: Option<&str>,
+) {
+    let Some(store) = state.telemetry_store.as_ref() else {
+        debug!(
+            request_id,
+            "Telemetry store disabled; skipping request finish"
+        );
+        return;
+    };
+
+    if let Err(error) = store
+        .finish_request(request_id, now_ms(), status_code, error_message)
+        .await
+    {
+        warn!(
+            request_id,
+            error = %error,
+            "Failed to persist request completion telemetry"
+        );
+    }
+}
+
+async fn persist_request_tool_events(
+    state: &AppState,
+    request_id: &str,
+    telemetry_bytes: &[u8],
+    source: &str,
+) {
+    let Some(store) = state.telemetry_store.as_ref() else {
+        debug!(
+            request_id,
+            "Telemetry store disabled; skipping tool event persistence"
+        );
+        return;
+    };
+
+    let events = extract_tool_events_from_json(request_id, telemetry_bytes, source);
+    debug!(
+        request_id,
+        event_count = events.len(),
+        "Parsed request tool telemetry"
+    );
+    for event in events {
+        if let Err(error) = store.insert_tool_event(&event).await {
+            warn!(
+                request_id = %event.request_id,
+                error = %error,
+                "Failed to persist request tool telemetry"
+            );
+        }
+    }
+}
+
+async fn persist_content_capture_from_bytes(
+    state: &AppState,
+    request_id: &str,
+    direction: &str,
+    source: &str,
+    content_type: Option<&str>,
+    bytes: &[u8],
+    observed_bytes: usize,
+    already_truncated: bool,
+) {
+    let Some(store) = state.telemetry_store.as_ref() else {
+        return;
+    };
+    let capture_enabled = match direction {
+        "request" => state.config.dashboard.capture.prompts,
+        "response" => state.config.dashboard.capture.responses,
+        _ => false,
+    };
+    if !capture_enabled || bytes.is_empty() {
+        return;
+    }
+
+    let Some(capture_preview) = prepare_capture_preview(
+        direction,
+        content_type,
+        bytes,
+        state.config.dashboard.capture.max_body_bytes,
+        observed_bytes,
+        already_truncated,
+    ) else {
+        debug!(
+            request_id,
+            direction, "Skipping content capture for non-UTF-8 payload"
+        );
+        return;
+    };
+    persist_content_capture_from_text(
+        state,
+        store,
+        request_id,
+        direction,
+        source,
+        content_type,
+        &capture_preview.preview_text,
+        capture_preview.truncated,
+    )
+    .await;
+}
+
+async fn persist_content_capture_from_text(
+    state: &AppState,
+    store: &TelemetryStore,
+    request_id: &str,
+    direction: &str,
+    source: &str,
+    content_type: Option<&str>,
+    preview: &str,
+    truncated: bool,
+) {
+    let mut redacted = false;
+    let preview_text = if state.config.dashboard.capture.redact_before_store {
+        if state.pipeline.is_empty() {
+            warn!(
+                request_id,
+                direction,
+                "Skipping content capture because redact_before_store is enabled but no scanners are configured"
+            );
+            return;
+        }
+        let mut context = RedactionContext::new(request_id, &state.config.redaction);
+        redacted = true;
+        scan_and_redact(state, request_id, preview, &mut context).text
+    } else {
+        preview.to_string()
+    };
+
+    let capture = ContentCaptureRecord {
+        request_id: request_id.to_string(),
+        observed_at_ms: now_ms(),
+        direction: direction.to_string(),
+        source: source.to_string(),
+        content_type: content_type.map(ToOwned::to_owned),
+        preview_text,
+        truncated,
+        redacted,
+    };
+    if let Err(error) = store.insert_content_capture(&capture).await {
+        warn!(
+            request_id,
+            direction,
+            error = %error,
+            "Failed to persist content capture"
+        );
+    }
+}
+
+struct CapturePreviewBuffer {
+    buffer: Vec<u8>,
+    cap_bytes: usize,
+    observed_bytes: usize,
+    truncated: bool,
+}
+
+impl CapturePreviewBuffer {
+    fn new(cap_bytes: usize) -> Self {
+        Self {
+            buffer: Vec::new(),
+            cap_bytes,
+            observed_bytes: 0,
+            truncated: false,
+        }
+    }
+
+    fn observe(&mut self, bytes: &[u8]) {
+        self.observed_bytes = self.observed_bytes.saturating_add(bytes.len());
+        if self.truncated {
+            return;
+        }
+        let remaining = self.cap_bytes.saturating_sub(self.buffer.len());
+        if bytes.len() > remaining {
+            self.buffer.extend_from_slice(&bytes[..remaining]);
+            self.truncated = true;
+            return;
+        }
+        self.buffer.extend_from_slice(bytes);
+    }
+
+    fn bytes(&self) -> &[u8] {
+        &self.buffer
+    }
+
+    fn truncated(&self) -> bool {
+        self.truncated
+    }
+
+    fn observed_bytes(&self) -> usize {
+        self.observed_bytes
+    }
+}
+
+struct PreparedCapturePreview {
+    preview_text: String,
+    truncated: bool,
+}
+
+fn prepare_capture_preview(
+    direction: &str,
+    content_type: Option<&str>,
+    bytes: &[u8],
+    max_bytes: usize,
+    observed_bytes: usize,
+    already_truncated: bool,
+) -> Option<PreparedCapturePreview> {
+    let observed_bytes = observed_bytes.max(bytes.len());
+    if is_html_content_type(content_type) {
+        return Some(PreparedCapturePreview {
+            preview_text: html_capture_summary(direction, content_type, observed_bytes),
+            truncated: false,
+        });
+    }
+
+    let (preview_text, truncated) = preview_text(bytes, max_bytes)?;
+    Some(PreparedCapturePreview {
+        preview_text,
+        truncated: already_truncated || truncated,
+    })
+}
+
+fn is_html_content_type(content_type: Option<&str>) -> bool {
+    content_type
+        .and_then(|value| value.split(';').next())
+        .map(|mime| {
+            let mime = mime.trim();
+            mime.eq_ignore_ascii_case("text/html")
+                || mime.eq_ignore_ascii_case("application/xhtml+xml")
+        })
+        .unwrap_or(false)
+}
+
+fn html_capture_summary(
+    direction: &str,
+    content_type: Option<&str>,
+    observed_bytes: usize,
+) -> String {
+    let content_type = content_type
+        .map(|value| value.trim())
+        .filter(|value| !value.is_empty())
+        .unwrap_or("unknown");
+    format!(
+        "[HTML {direction} body omitted from dashboard capture: content_type=\"{content_type}\", body_bytes={observed_bytes}]"
+    )
+}
+
+fn preview_text(bytes: &[u8], max_bytes: usize) -> Option<(String, bool)> {
+    let limit = bytes.len().min(max_bytes);
+    let mut end = limit;
+    loop {
+        match std::str::from_utf8(&bytes[..end]) {
+            Ok(text) => return Some((text.to_string(), bytes.len() > end)),
+            Err(error) => {
+                let valid_up_to = error.valid_up_to();
+                if valid_up_to == 0 {
+                    return None;
+                }
+                end = valid_up_to;
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn prepare_capture_preview_omits_html_body() {
+        let html = b"<!doctype html><html><body>cloudflare challenge</body></html>";
+
+        let preview = prepare_capture_preview(
+            "response",
+            Some("text/html; charset=UTF-8"),
+            html,
+            8192,
+            html.len(),
+            false,
+        )
+        .expect("html preview should be summarized");
+
+        assert_eq!(
+            preview.preview_text,
+            format!(
+                "[HTML response body omitted from dashboard capture: content_type=\"text/html; charset=UTF-8\", body_bytes={}]",
+                html.len()
+            )
+        );
+        assert!(!preview.truncated);
+        assert!(!preview.preview_text.contains("<html>"));
+    }
+
+    #[test]
+    fn prepare_capture_preview_keeps_json_text() {
+        let body = br#"{"ok":true}"#;
+
+        let preview = prepare_capture_preview(
+            "response",
+            Some("application/json"),
+            body,
+            8192,
+            body.len(),
+            false,
+        )
+        .expect("json preview should be captured");
+
+        assert_eq!(preview.preview_text, r#"{"ok":true}"#);
+        assert!(!preview.truncated);
+    }
+
+    #[test]
+    fn capture_preview_buffer_counts_observed_bytes_after_cap() {
+        let mut buffer = CapturePreviewBuffer::new(4);
+
+        buffer.observe(b"abcd");
+        buffer.observe(b"efgh");
+        buffer.observe(b"ijkl");
+
+        assert_eq!(buffer.bytes(), b"abcd");
+        assert_eq!(buffer.observed_bytes(), 12);
+        assert!(buffer.truncated());
+    }
+
+    #[test]
+    fn build_upstream_url_preserves_absolute_proxy_uri() {
+        let uri: Uri = "http://127.0.0.1:5180/index.html?x=1".parse().unwrap();
+
+        let upstream = build_upstream_url("https://api.anthropic.com", &uri);
+
+        assert_eq!(upstream, "http://127.0.0.1:5180/index.html?x=1");
+    }
+
+    #[test]
+    fn build_upstream_url_joins_origin_form_uri() {
+        let uri: Uri = "/v1/messages?x=1".parse().unwrap();
+
+        let upstream = build_upstream_url("https://api.anthropic.com/", &uri);
+
+        assert_eq!(upstream, "https://api.anthropic.com/v1/messages?x=1");
+    }
 }
 
 fn is_mitm_excluded_host(state: &AppState, host: &str) -> bool {
@@ -343,6 +995,7 @@ async fn handle_mitm_http_request(
     let method = req.method().clone();
     let uri = req.uri().clone();
     let headers = req.headers().clone();
+    let request_id = next_request_id();
     let path_and_query = uri
         .path_and_query()
         .map(|value| value.as_str())
@@ -359,6 +1012,7 @@ async fn handle_mitm_http_request(
 
     debug!(
         mode = "mitm",
+        request_id = %request_id,
         method = %method,
         path = %path_and_query,
         upstream = %upstream_url,
@@ -374,6 +1028,7 @@ async fn handle_mitm_http_request(
         route.is_codex_responses || state.config.scanner.enabled,
         route.needs_codex_subscription_payload_normalization,
         "mitm",
+        request_id,
     )
     .await
     {
@@ -399,6 +1054,7 @@ async fn handle_mitm_websocket_upgrade(
     let headers = req.headers().clone();
     let path = req.uri().path().to_string();
     let websocket_mode = state.config.proxy.websocket_mode.as_str();
+    let request_id = next_request_id();
 
     if websocket_mode == "reject" {
         info!(
@@ -463,6 +1119,9 @@ async fn handle_mitm_websocket_upgrade(
                     upgraded,
                     upstream_ws,
                     websocket_mode_owned,
+                    request_id,
+                    upstream_url,
+                    path,
                 )
                 .await
                 {
@@ -507,8 +1166,41 @@ async fn proxy_mitm_websocket(
     upgraded: Upgraded,
     mut upstream_ws: UpstreamWebSocket,
     websocket_mode: String,
+    request_id: String,
+    upstream_url: String,
+    path: String,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    info!(mode = "mitm", websocket_mode = %websocket_mode, "Starting WebSocket MITM session");
+    info!(
+        mode = "mitm",
+        request_id = %request_id,
+        websocket_mode = %websocket_mode,
+        upstream = %upstream_url,
+        "Starting WebSocket MITM session"
+    );
+    debug!(
+        mode = "mitm",
+        request_id = %request_id,
+        websocket_mode = %websocket_mode,
+        server_to_client_restoration = false,
+        "WebSocket restoration policy"
+    );
+    let telemetry_context = RequestTelemetryContext {
+        request_id: request_id.clone(),
+        started_at_ms: now_ms(),
+        method: "WEBSOCKET".to_string(),
+        path,
+        mode: "mitm-websocket".to_string(),
+        upstream: upstream_url.clone(),
+        model: None,
+    };
+    persist_request_start(&state, &telemetry_context).await;
+    persist_request_finish(
+        &state,
+        &request_id,
+        Some(StatusCode::SWITCHING_PROTOCOLS.as_u16()),
+        None,
+    )
+    .await;
 
     let client_io = TokioIo::new(upgraded);
     let mut client_ws =
@@ -524,11 +1216,21 @@ async fn proxy_mitm_websocket(
                 };
                 let message = client_msg?;
                 let is_close = matches!(message, Message::Close(_));
-                let message = if websocket_mode == "inspect" {
-                    redact_websocket_message(&state, message)
+                let message = if websocket_mode == "inspect" && state.config.scanner.enabled {
+                    redact_websocket_message(&state, &request_id, message)
                 } else {
                     message
                 };
+                if let Message::Text(text) = &message {
+                    spawn_websocket_text_telemetry(
+                        state.clone(),
+                        request_id.clone(),
+                        telemetry_context.model.clone(),
+                        upstream_url.clone(),
+                        text.to_string(),
+                        "client",
+                    );
+                }
                 upstream_ws.send(message).await?;
                 if is_close {
                     let _ = client_ws.close(None).await;
@@ -542,6 +1244,16 @@ async fn proxy_mitm_websocket(
                 };
                 let message = upstream_msg?;
                 let is_close = matches!(message, Message::Close(_));
+                if let Message::Text(text) = &message {
+                    spawn_websocket_text_telemetry(
+                        state.clone(),
+                        request_id.clone(),
+                        telemetry_context.model.clone(),
+                        upstream_url.clone(),
+                        text.to_string(),
+                        "upstream",
+                    );
+                }
                 client_ws.send(message).await?;
                 if is_close {
                     let _ = upstream_ws.close(None).await;
@@ -555,6 +1267,84 @@ async fn proxy_mitm_websocket(
     let _ = upstream_ws.close(None).await;
 
     Ok(())
+}
+
+fn spawn_websocket_text_telemetry(
+    state: Arc<AppState>,
+    request_id: String,
+    model: Option<String>,
+    upstream_url: String,
+    text: String,
+    direction: &'static str,
+) {
+    tokio::spawn(async move {
+        persist_websocket_text_telemetry(
+            &state,
+            &request_id,
+            model.as_deref(),
+            &upstream_url,
+            &text,
+            direction,
+        )
+        .await;
+    });
+}
+
+async fn persist_websocket_text_telemetry(
+    state: &AppState,
+    request_id: &str,
+    model: Option<&str>,
+    upstream_url: &str,
+    text: &str,
+    direction: &str,
+) {
+    let Some(store) = state.telemetry_store.as_ref() else {
+        debug!(
+            request_id,
+            direction, "Telemetry store disabled; skipping WebSocket telemetry"
+        );
+        return;
+    };
+
+    let (usage_records, tool_events) =
+        extract_websocket_text_telemetry(request_id, model, upstream_url, text);
+    debug!(
+        request_id,
+        direction,
+        usage_count = usage_records.len(),
+        tool_event_count = tool_events.len(),
+        "Parsed WebSocket telemetry frame"
+    );
+    persist_response_telemetry_records(store, usage_records, tool_events, "websocket").await;
+
+    let capture_direction = match direction {
+        "client" => "request",
+        "upstream" => "response",
+        _ => return,
+    };
+    let capture_enabled = match capture_direction {
+        "request" => state.config.dashboard.capture.prompts,
+        "response" => state.config.dashboard.capture.responses,
+        _ => false,
+    };
+    if capture_enabled
+        && let Some((preview, truncated)) = preview_text(
+            text.as_bytes(),
+            state.config.dashboard.capture.max_body_bytes,
+        )
+    {
+        persist_content_capture_from_text(
+            state,
+            store,
+            request_id,
+            capture_direction,
+            "websocket",
+            Some("application/json"),
+            &preview,
+            truncated,
+        )
+        .await;
+    }
 }
 
 fn build_websocket_upstream_request(
@@ -577,20 +1367,24 @@ fn build_websocket_upstream_request(
     Ok(upstream_request)
 }
 
-fn redact_websocket_message(state: &AppState, message: Message) -> Message {
+fn redact_websocket_message(state: &AppState, request_id: &str, message: Message) -> Message {
     match message {
         Message::Text(text) => {
             let original_len = text.len();
-            let redacted = scan_and_redact(state, text.as_str());
-            if redacted.len() != original_len || redacted.as_str() != text.as_str() {
+            let mut context = RedactionContext::new(request_id, &state.config.redaction);
+            let redacted = scan_and_redact(state, request_id, text.as_str(), &mut context);
+            if redacted.text.len() != original_len || redacted.text.as_str() != text.as_str() {
                 info!(
                     mode = "mitm",
+                    request_id,
                     original_len,
-                    redacted_len = redacted.len(),
+                    redacted_len = redacted.text.len(),
+                    findings = redacted.findings.len(),
+                    replacements = redacted.replacements.len(),
                     "Redacted WebSocket text frame"
                 );
             }
-            Message::Text(redacted.into())
+            Message::Text(redacted.text.into())
         }
         other => other,
     }
@@ -725,11 +1519,14 @@ fn subscription_upstream_url(base_url: &str, uri: &Uri) -> String {
 
 struct ProcessedBody {
     bytes: Bytes,
+    telemetry_bytes: Bytes,
     strip_content_encoding: bool,
+    context: RedactionContext,
 }
 
 fn process_request_body(
     state: &AppState,
+    request_id: &str,
     headers: &HeaderMap,
     body: &Bytes,
     allow_normalization: bool,
@@ -749,11 +1546,15 @@ fn process_request_body(
     } else {
         normalized
     };
+    let telemetry_bytes = normalized.bytes.clone();
+    let mut context = RedactionContext::new(request_id, &state.config.redaction);
 
     if !state.config.scanner.enabled {
         return Ok(ProcessedBody {
             bytes: normalized.bytes,
+            telemetry_bytes,
             strip_content_encoding: normalized.decoded,
+            context,
         });
     }
 
@@ -762,7 +1563,9 @@ fn process_request_body(
         warn!("Skipping secret scan because request body content-encoding could not be decoded");
         return Ok(ProcessedBody {
             bytes: normalized.bytes,
+            telemetry_bytes,
             strip_content_encoding: false,
+            context,
         });
     }
 
@@ -770,14 +1573,18 @@ fn process_request_body(
         warn!("Skipping secret scan for non-UTF-8 request body");
         return Ok(ProcessedBody {
             bytes: normalized.bytes,
+            telemetry_bytes,
             strip_content_encoding: normalized.decoded,
+            context,
         });
     };
 
-    let redacted_body = scan_and_redact(state, body_string);
+    let redacted_body = scan_and_redact(state, request_id, body_string, &mut context);
     Ok(ProcessedBody {
-        bytes: Bytes::from(redacted_body.into_bytes()),
+        bytes: Bytes::from(redacted_body.text.into_bytes()),
+        telemetry_bytes,
         strip_content_encoding: normalized.decoded,
+        context,
     })
 }
 
@@ -887,35 +1694,51 @@ fn decompress_zstd(body: &[u8], max_body_size: usize) -> Option<Bytes> {
 }
 
 /// Scan text for secrets and redact them.
-fn scan_and_redact(state: &AppState, text: &str) -> String {
+fn scan_and_redact(
+    state: &AppState,
+    request_id: &str,
+    text: &str,
+    context: &mut RedactionContext,
+) -> crate::redactor::RedactionResult {
     let matches = state.pipeline.scan(text);
 
     if matches.is_empty() {
-        debug!("No secrets found in request body");
-        return text.to_string();
+        debug!(request_id, "No sensitive data found");
+        return crate::redactor::RedactionResult {
+            text: text.to_string(),
+            findings: Vec::new(),
+            replacements: Vec::new(),
+            skipped: 0,
+        };
     }
 
     info!(
-        secrets_found = matches.len(),
-        "Redacting secrets from request body"
+        request_id,
+        findings = matches.len(),
+        "Redacting sensitive data"
     );
 
-    let mut result = text.to_string();
-    // Sort matches by position descending so replacements don't shift offsets
-    let mut sorted_matches = matches;
-    sorted_matches.sort_by(|a, b| b.start.cmp(&a.start));
-
-    for m in &sorted_matches {
-        let redacted = state.redactor.redact(&m.value);
-        log_redaction(m, &redacted);
-        result = result.replace(&m.value, &redacted);
+    let result = state.redactor.redact_findings(text, matches, context);
+    for replacement in &result.replacements {
+        if let Some(finding) = result.findings.iter().find(|finding| {
+            finding.start == replacement.start
+                && finding.end == replacement.end
+                && finding.category == replacement.category
+        }) {
+            log_redaction(finding, replacement.replacement_len);
+        }
     }
 
     result
 }
 
 /// Scan and redact non-whitelisted header values when scan_scope is "full".
-fn scan_and_redact_headers(state: &AppState, headers: &HeaderMap) -> HeaderMap {
+fn scan_and_redact_headers(
+    state: &AppState,
+    headers: &HeaderMap,
+    request_id: &str,
+    context: &mut RedactionContext,
+) -> HeaderMap {
     let whitelist: Vec<String> = state
         .config
         .scanner
@@ -935,9 +1758,9 @@ fn scan_and_redact_headers(state: &AppState, headers: &HeaderMap) -> HeaderMap {
             continue;
         }
         if let Ok(val_str) = value.to_str() {
-            let redacted = scan_and_redact(state, val_str);
-            if redacted != val_str
-                && let Ok(new_val) = HeaderValue::from_str(&redacted)
+            let redacted = scan_and_redact(state, request_id, val_str, context);
+            if redacted.text != val_str
+                && let Ok(new_val) = HeaderValue::from_str(&redacted.text)
             {
                 result.append(name.clone(), new_val);
                 continue;
@@ -949,7 +1772,12 @@ fn scan_and_redact_headers(state: &AppState, headers: &HeaderMap) -> HeaderMap {
 }
 
 /// Scan and redact query parameter values when scan_scope is "full".
-fn scan_and_redact_query_params(state: &AppState, url: &str) -> String {
+fn scan_and_redact_query_params(
+    state: &AppState,
+    url: &str,
+    request_id: &str,
+    context: &mut RedactionContext,
+) -> String {
     let Some((base, query)) = url.split_once('?') else {
         return url.to_string();
     };
@@ -957,11 +1785,11 @@ fn scan_and_redact_query_params(state: &AppState, url: &str) -> String {
     let mut serializer = form_urlencoded::Serializer::new(String::new());
     let mut changed = false;
     for (key, value) in form_urlencoded::parse(query.as_bytes()) {
-        let redacted_value = scan_and_redact(state, &value);
-        if redacted_value != value {
+        let redacted_value = scan_and_redact(state, request_id, &value, context);
+        if redacted_value.text != value {
             changed = true;
         }
-        serializer.append_pair(&key, &redacted_value);
+        serializer.append_pair(&key, &redacted_value.text);
     }
 
     if changed {
@@ -973,6 +1801,10 @@ fn scan_and_redact_query_params(state: &AppState, url: &str) -> String {
 
 /// Build the full upstream URL from base URL and request URI.
 fn build_upstream_url(base: &str, uri: &Uri) -> String {
+    if uri.scheme().is_some() && uri.authority().is_some() {
+        return uri.to_string();
+    }
+
     let base = base.trim_end_matches('/');
     let path_and_query = uri.path_and_query().map(|pq| pq.as_str()).unwrap_or("/");
 

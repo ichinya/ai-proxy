@@ -30,12 +30,15 @@ pub fn logging_enabled_from_env() -> bool {
 }
 
 /// Log a redaction event for audit purposes.
-pub fn log_redaction(scan_match: &ScanMatch, redacted_to: &str) {
+pub fn log_redaction(scan_match: &ScanMatch, replacement_len: usize) {
     info!(
         scanner = %scan_match.scanner,
         pattern = %scan_match.pattern_name,
+        category = %scan_match.category,
+        sensitivity_class = %scan_match.sensitivity_class,
+        confidence = scan_match.confidence,
         original_len = scan_match.value.len(),
-        redacted_to = %redacted_to,
+        replacement_len,
         position_start = scan_match.start,
         position_end = scan_match.end,
         "Secret redacted"

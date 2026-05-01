@@ -47,13 +47,14 @@ impl StructuralScanner {
             .find_iter(text)
             .map(|m| {
                 trace!(start = m.start(), end = m.end(), "JWT token detected");
-                ScanMatch {
-                    value: m.as_str().to_string(),
-                    scanner: "structural".to_string(),
-                    pattern_name: "jwt_token".to_string(),
-                    start: m.start(),
-                    end: m.end(),
-                }
+                ScanMatch::new(
+                    m.as_str().to_string(),
+                    "structural",
+                    "jwt_token",
+                    m.start(),
+                    m.end(),
+                    0.98,
+                )
             })
             .collect()
     }
@@ -67,13 +68,14 @@ impl StructuralScanner {
                     end = m.end(),
                     "Connection string detected"
                 );
-                ScanMatch {
-                    value: m.as_str().to_string(),
-                    scanner: "structural".to_string(),
-                    pattern_name: "connection_string".to_string(),
-                    start: m.start(),
-                    end: m.end(),
-                }
+                ScanMatch::new(
+                    m.as_str().to_string(),
+                    "structural",
+                    "connection_string",
+                    m.start(),
+                    m.end(),
+                    0.98,
+                )
             })
             .collect()
     }
@@ -83,13 +85,14 @@ impl StructuralScanner {
             .find_iter(text)
             .map(|m| {
                 trace!(start = m.start(), end = m.end(), ".env pattern detected");
-                ScanMatch {
-                    value: m.as_str().to_string(),
-                    scanner: "structural".to_string(),
-                    pattern_name: "env_variable".to_string(),
-                    start: m.start(),
-                    end: m.end(),
-                }
+                ScanMatch::new(
+                    m.as_str().to_string(),
+                    "structural",
+                    "env_variable",
+                    m.start(),
+                    m.end(),
+                    0.90,
+                )
             })
             .collect()
     }

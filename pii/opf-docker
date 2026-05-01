@@ -1,0 +1,9 @@
+#!/bin/sh
+set -eu
+
+IMAGE="${OPF_DOCKER_IMAGE:-ai-proxy-opf:local}"
+
+exec docker run --rm -i \
+  -v ai-proxy-opf-cache:/root/.opf \
+  -v ai-proxy-hf-cache:/root/.cache/huggingface \
+  "$IMAGE" "$@"

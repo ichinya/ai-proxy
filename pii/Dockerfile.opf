@@ -1,0 +1,16 @@
+FROM python:3.12-slim
+
+ENV PYTHONDONTWRITEBYTECODE=1
+ENV PYTHONUNBUFFERED=1
+
+WORKDIR /app/privacy-filter
+
+COPY privacy-filter/pyproject.toml ./
+COPY privacy-filter/README.md ./
+COPY privacy-filter/opf ./opf
+
+RUN python -m pip install --upgrade pip \
+    && python -m pip install --no-cache-dir --index-url https://download.pytorch.org/whl/cpu torch \
+    && python -m pip install --no-cache-dir -e .
+
+ENTRYPOINT ["opf"]

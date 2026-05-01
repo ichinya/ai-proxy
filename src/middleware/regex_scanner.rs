@@ -62,13 +62,14 @@ impl SecretScanner for RegexScanner {
                     end = m.end(),
                     "Regex match found"
                 );
-                matches.push(ScanMatch {
-                    value: m.as_str().to_string(),
-                    scanner: "regex".to_string(),
-                    pattern_name: pattern.name.clone(),
-                    start: m.start(),
-                    end: m.end(),
-                });
+                matches.push(ScanMatch::new(
+                    m.as_str().to_string(),
+                    "regex",
+                    pattern.name.clone(),
+                    m.start(),
+                    m.end(),
+                    0.95,
+                ));
             }
         }
 
@@ -114,6 +115,7 @@ mod tests {
         assert_eq!(matches.len(), 1);
         assert_eq!(matches[0].pattern_name, "aws_access_key");
         assert_eq!(matches[0].value, "AKIAIOSFODNN7EXAMPLE");
+        assert_eq!(matches[0].category, "api_key");
     }
 
     #[test]

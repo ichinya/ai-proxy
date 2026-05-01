@@ -12,6 +12,8 @@ Codex CLI    -->  ai-proxy (localhost:8080)  -->  api.openai.com
 
 - **3-layer secret scanning**: regex patterns, Shannon entropy analysis, structural detection (JWT, connection strings, .env)
 - **Partial masking**: `sk-ant-abcdef...xyz` becomes `sk-***...***xyz`
+- **Typed placeholders**: optional reversible PII pseudonymization such as `ada@example.com` to `[EMAIL_1]`
+- **Local model scanner**: optional OpenAI-compatible/Ollama-style semantic PII scanner for hybrid detection
 - **SSE streaming**: responses stream through without buffering
 - **Configurable scan scope**: body-only or full (body + headers + query params)
 - **Anthropic + Codex routing**: Anthropic-compatible requests go to `anthropic_upstream_url`; OpenAI Responses/Codex requests go to `codex_upstream_url` or `codex_subscription_url`
@@ -160,13 +162,17 @@ Configure Codex globally with `~/.codex/.env`:
 HTTPS_PROXY=http://server:8080
 HTTP_PROXY=http://server:8080
 SSL_CERT_FILE=/Users/macos/ai-proxy-ca.pem
-NO_PROXY=github.com,api.github.com,githubusercontent.com
+NO_PROXY=localhost,127.0.0.1,::1,github.com,.github.com,api.github.com,githubusercontent.com,.githubusercontent.com,ghcr.io,.ghcr.io,auth.docker.io
+no_proxy=localhost,127.0.0.1,::1,github.com,.github.com,api.github.com,githubusercontent.com,.githubusercontent.com,ghcr.io,.ghcr.io,auth.docker.io
 ```
 
 Codex loads `~/.codex/.env` into its process environment. Commands started from
 Codex, including `gh`, `git`, and `curl`, inherit these variables and will use the
-same proxy unless a host matches `NO_PROXY`. Keep GitHub in `NO_PROXY` unless you
-intentionally want GitHub CLI traffic to pass through the local MITM CA.
+same proxy unless a host matches `NO_PROXY` or `no_proxy`. Keep GitHub,
+`ghcr.io`, and `auth.docker.io` in `NO_PROXY` unless you intentionally want
+GitHub CLI, Homebrew, or Docker registry auth traffic to pass through the local MITM CA. Do not add
+`chatgpt.com`, `api.openai.com`, or `api.anthropic.com` when you want model
+traffic, token usage, and tool history to be visible in the dashboard.
 
 Run `codex login` once if you are not already signed in, choose ChatGPT sign-in, then run `codex` normally. Do not set `OPENAI_API_KEY` for this subscription flow.
 
@@ -218,13 +224,19 @@ websocket_mode = "inspect"            # reject | passthrough | inspect; default 
 
 ```toml
 [redaction]
-strategy = "partial"    # masking strategy
+strategy = "partial"    # partial | placeholder
 prefix_len = 3          # visible prefix characters
 suffix_len = 3          # visible suffix characters
 mask = "***...***"      # mask placeholder
+response_restore_enabled = false
+restorable_categories = ["email", "person_name", "phone"]
 ```
 
 A secret like `sk-ant-abcdef123456789xyz` becomes `sk-***...***xyz`. Secrets shorter than `prefix_len + suffix_len + 2` characters are fully masked.
+
+Set `strategy = "placeholder"` to send typed placeholders upstream instead of masked values. PII categories listed in `restorable_categories` can be restored in downstream HTTP responses when `response_restore_enabled = true`; secret categories such as API keys, passwords, private keys, JWTs, and connection strings are not restored by default. Request-local placeholder maps are kept only for the active request/response and are not logged.
+
+SSE and chunked responses use a bounded rolling buffer so placeholders split across chunks, for example `[EMAIL_1]`, can still be restored without buffering the full stream. WebSocket MITM inspection currently redacts client-to-upstream text frames only; server-to-client WebSocket restoration is intentionally not enabled in this implementation.
 
 ### Scanner
 
@@ -241,6 +253,192 @@ header_whitelist = [    # headers skipped during scanning (auth headers forwarde
 ]
 ```
 
+### Local Model Scanner
+
+The deterministic regex, entropy, and structural scanners remain the baseline. A local model scanner can be enabled as an additional semantic scanner for categories such as email, person names, and phone numbers:
+
+```toml
+[scanner.model]
+enabled = false
+mode = "hybrid"                    # hybrid | verify_only | direct
+endpoint = "http://127.0.0.1:11434/v1/chat/completions"
+model = "llama3.1"
+timeout_ms = 750
+max_chars = 8192
+fail_policy = "regex_only"         # regex_only | fail_closed
+categories = ["email", "person_name", "phone"]
+```
+
+`hybrid` keeps deterministic findings and adds high-confidence model findings. `direct` uses only the model scanner and should be enabled deliberately. `verify_only` is reserved for conservative model-assisted decisions and never suppresses hard secret matches by default. The model prompt requests strict JSON byte offsets and forbids quoting sensitive content. Invalid JSON, unknown categories, low confidence, invalid spans, timeouts, and provider failures fall back according to `fail_policy`; the default `regex_only` keeps deterministic scanning behavior.
+
+Tokenizer support is not required for the MVP. Use `max_chars` as a conservative byte/character cap until a specific provider requires exact token accounting.
+
+### Privacy Filter Scanner
+
+OpenAI Privacy Filter can be integrated through a local adapter service or by running the `opf` CLI. The proxy needs byte-offset spans, so CLI mode always invokes the command with `--format json`, sends the scan text on stdin, and reads `detected_spans` from stdout.
+
+```toml
+[scanner.privacy_filter]
+enabled = false
+endpoint = "http://127.0.0.1:18082/scan"
+command = ""                    # set to "opf" instead of endpoint to use the local CLI
+command_args = []               # example: ["--device", "cpu", "--no-print-color-coded-text"]
+timeout_ms = 750
+max_chars = 8192
+fail_policy = "regex_only"         # regex_only | fail_closed
+categories = [
+    "private_person",
+    "private_email",
+    "private_phone",
+    "private_address",
+    "private_url",
+    "private_date",
+    "account_number",
+    "secret",
+]
+min_confidence = 0.70
+```
+
+Set either `endpoint` or `command`, not both. With `command = "opf"`, install OpenAI Privacy Filter so `opf` is on the service `PATH`; the proxy appends `--format json` automatically and does not execute the command through a shell. To force CPU mode and keep stdout clean, use `command_args = ["--device", "cpu", "--no-print-color-coded-text"]`.
+
+Custom commands must be OPF-compatible: they must accept `--format json`, read the text to scan from stdin, and write a JSON object to stdout with `detected_spans` entries containing `label`, `start`, and `end` byte offsets:
+
+```json
+{"detected_spans":[{"label":"private_email","start":6,"end":21}]}
+```
+
+The command JSON may include additional OPF fields such as `schema_version`, `summary`, `text`, `redacted_text`, span `text`, or `placeholder`; the proxy ignores fields it does not need.
+
+If local Python cannot install `torch`, build and use the Docker wrapper:
+
+```bash
+env -u HTTPS_PROXY -u HTTP_PROXY -u ALL_PROXY -u https_proxy -u http_proxy -u all_proxy \
+  docker build -f pii/Dockerfile.opf -t ai-proxy-opf:local pii
+```
+
+Then configure the scanner to run OPF through Docker:
+
+```toml
+[scanner.privacy_filter]
+enabled = true
+endpoint = ""
+command = "/Users/macos/Projects/2080/ai-proxy/pii/opf-docker"
+command_args = ["--device", "cpu", "--no-print-color-coded-text"]
+```
+
+The wrapper stores OPF and Hugging Face downloads in Docker volumes so the model is not downloaded on every scan.
+
+### OPF Setup Guide
+
+Use the local Python install when a supported Python version and `torch` wheel are available. Python 3.13 may not have a compatible `torch` wheel; Python 3.12 is the safer default.
+
+```bash
+cd /Users/macos/Projects/2080/ai-proxy
+
+# If needed:
+brew install python@3.12
+
+/opt/homebrew/bin/python3.12 -m venv pii/.venv-opf
+source pii/.venv-opf/bin/activate
+python -m pip install --upgrade pip
+python -m pip install --default-timeout 120 -e pii/privacy-filter
+```
+
+Verify the CLI:
+
+```bash
+pii/.venv-opf/bin/opf --device cpu --no-print-color-coded-text --format json \
+  "Привет меня зовут Иван Иванов мой номер 79222222222"
+```
+
+If local Python install fails, use Docker instead:
+
+```bash
+env -u HTTPS_PROXY -u HTTP_PROXY -u ALL_PROXY -u https_proxy -u http_proxy -u all_proxy \
+  docker build -f pii/Dockerfile.opf -t ai-proxy-opf:local pii
+```
+
+Preload the OPF checkpoint into Docker volumes. The first run may download about 2.8 GB from Hugging Face:
+
+```bash
+printf '%s' 'warmup' | env -u HTTPS_PROXY -u HTTP_PROXY -u ALL_PROXY -u https_proxy -u http_proxy -u all_proxy \
+  pii/opf-docker --device cpu --no-print-color-coded-text --format json
+```
+
+Configure the proxy with either the Python venv command:
+
+```toml
+[scanner.privacy_filter]
+enabled = true
+endpoint = ""
+command = "/Users/macos/Projects/2080/ai-proxy/pii/.venv-opf/bin/opf"
+command_args = ["--device", "cpu", "--no-print-color-coded-text"]
+timeout_ms = 15000
+```
+
+Or with the Docker wrapper:
+
+```toml
+[scanner.privacy_filter]
+enabled = true
+endpoint = ""
+command = "/Users/macos/Projects/2080/ai-proxy/pii/opf-docker"
+command_args = ["--device", "cpu", "--no-print-color-coded-text"]
+timeout_ms = 30000
+```
+
+For reversible PII placeholders in model responses, enable placeholder redaction and include the categories you want to restore:
+
+```toml
+[redaction]
+strategy = "placeholder"
+response_restore_enabled = true
+restorable_categories = ["email", "person_name", "phone", "account_number"]
+```
+
+The adapter request body is:
+
+```json
+{"text":"email ada@example.com","categories":["private_email"]}
+```
+
+The adapter response must use UTF-8 byte offsets in the exact request text:
+
+```json
+{"findings":[{"start":6,"end":21,"category":"private_email","confidence":0.93}]}
+```
+
+`spans` is also accepted as an alias for `findings`, and `label` is accepted as an alias for `category`. Endpoint mode does not consume OPF CLI's top-level `detected_spans`; use `findings` or `spans` from an adapter, or use `command` mode for raw OPF JSON. Privacy Filter labels are mapped into the proxy's redaction categories, for example `private_email -> email`, `private_person -> person_name`, `account_number -> account_number`, and `secret -> generic_secret`. Invalid spans, disabled labels, and findings below `min_confidence` are ignored. The default `regex_only` fail policy keeps deterministic scanners active if the adapter times out or returns invalid JSON.
+
+### Dashboard
+
+```toml
+[dashboard]
+enabled = false
+listen_addr = "127.0.0.1:18081"   # loopback only; use SSH tunneling for remote access
+sqlite_path = "ai-proxy-telemetry.sqlite"
+retention_hours = 24
+
+[dashboard.capture]
+prompts = false
+responses = false
+max_body_bytes = 8192
+redact_before_store = true
+```
+
+The dashboard listener is intentionally separate from the proxy listener and must bind to a loopback address.
+
+Enable it on the server and reach it through an SSH tunnel:
+
+```bash
+ssh -L 18081:127.0.0.1:18081 user@server
+open http://127.0.0.1:18081
+```
+
+The dashboard stores the rolling last 24 hours of proxy telemetry in SQLite by default. It records request metadata, token usage reported by upstream responses, and tool-call/tool-result markers visible in proxied JSON or SSE payloads. It does not record local shell or filesystem actions that never pass through the model API, and server logs must not include raw prompts, auth headers, cookies, tool arguments, or tool output bodies.
+
+Prompt and response previews are opt-in through `[dashboard.capture]`. With `redact_before_store = true`, the proxy scans/redacts a copy of the preview before writing it to SQLite. This does not require `[scanner].enabled = true`; that flag controls live traffic redaction and can break strict transports such as Codex WebSockets. Keep `[scanner].enabled = false` when you only want dashboard capture, but keep the scanner sub-sections such as `[scanner.regex]`, `[scanner.entropy]`, and `[scanner.structural]` configured so capture redaction has detectors to use. Set `prompts` or `responses` only on trusted machines and keep `max_body_bytes` small. HTML response bodies are omitted from previews and replaced with a short summary so Cloudflare/error pages do not fill the dashboard or SQLite database.
+
 ### Environment Overrides
 
 Runtime settings can be overridden without editing `config.toml`:
@@ -252,9 +450,28 @@ AI_PROXY_ENTROPY_SCANNER_ENABLED=false
 AI_PROXY_STRUCTURAL_SCANNER_ENABLED=false
 AI_PROXY_SCAN_SCOPE=full
 AI_PROXY_REDACTION_STRATEGY=partial
+AI_PROXY_RESPONSE_RESTORE_ENABLED=false
+AI_PROXY_RESTORABLE_CATEGORIES=email,person_name,phone
 AI_PROXY_REDACTION_PREFIX_LEN=3
 AI_PROXY_REDACTION_SUFFIX_LEN=3
 AI_PROXY_REDACTION_MASK='***...***'
+AI_PROXY_MODEL_SCANNER_ENABLED=false
+AI_PROXY_MODEL_SCANNER_MODE=hybrid
+AI_PROXY_MODEL_SCANNER_ENDPOINT=http://127.0.0.1:11434/v1/chat/completions
+AI_PROXY_MODEL_SCANNER_MODEL=llama3.1
+AI_PROXY_MODEL_SCANNER_TIMEOUT_MS=750
+AI_PROXY_MODEL_SCANNER_MAX_CHARS=8192
+AI_PROXY_MODEL_SCANNER_FAIL_POLICY=regex_only
+AI_PROXY_MODEL_SCANNER_CATEGORIES=email,person_name,phone
+AI_PROXY_PRIVACY_FILTER_SCANNER_ENABLED=false
+AI_PROXY_PRIVACY_FILTER_SCANNER_ENDPOINT=http://127.0.0.1:18082/scan
+AI_PROXY_PRIVACY_FILTER_SCANNER_COMMAND=
+AI_PROXY_PRIVACY_FILTER_SCANNER_COMMAND_ARGS=
+AI_PROXY_PRIVACY_FILTER_SCANNER_TIMEOUT_MS=750
+AI_PROXY_PRIVACY_FILTER_SCANNER_MAX_CHARS=8192
+AI_PROXY_PRIVACY_FILTER_SCANNER_FAIL_POLICY=regex_only
+AI_PROXY_PRIVACY_FILTER_SCANNER_CATEGORIES=private_person,private_email,private_phone,private_address,private_url,private_date,account_number,secret
+AI_PROXY_PRIVACY_FILTER_SCANNER_MIN_CONFIDENCE=0.70
 AI_PROXY_RATE_LIMIT_ENABLED=false       # disable rate limiting
 AI_PROXY_LOGGING_ENABLED=false          # disable tracing subscriber setup
 AI_PROXY_MAX_BODY_SIZE=20971520         # request body limit in bytes
@@ -272,6 +489,14 @@ AI_PROXY_MITM_CA_KEY_PATH=certs/ai-proxy-ca-key.pem
 AI_PROXY_MITM_CERT_CACHE_SIZE=256
 AI_PROXY_MITM_EXCLUDED_HOSTS=example.com,internal.example
 AI_PROXY_WEBSOCKET_MODE=inspect
+AI_PROXY_DASHBOARD_ENABLED=false
+AI_PROXY_DASHBOARD_LISTEN_ADDR=127.0.0.1:18081
+AI_PROXY_DASHBOARD_SQLITE_PATH=ai-proxy-telemetry.sqlite
+AI_PROXY_DASHBOARD_RETENTION_HOURS=24
+AI_PROXY_DASHBOARD_CAPTURE_PROMPTS=false
+AI_PROXY_DASHBOARD_CAPTURE_RESPONSES=false
+AI_PROXY_DASHBOARD_CAPTURE_MAX_BODY_BYTES=8192
+AI_PROXY_DASHBOARD_CAPTURE_REDACT_BEFORE_STORE=true
 ```
 
 Boolean env vars accept `true/false`, `1/0`, `on/off`, or `yes/no`.
@@ -364,7 +589,8 @@ Some Codex modes ignore `OPENAI_BASE_URL` and use `HTTPS_PROXY` with `CONNECT` t
 ```bash
 export HTTPS_PROXY=http://127.0.0.1:8080
 export HTTP_PROXY=http://127.0.0.1:8080
-export NO_PROXY=github.com,api.github.com,githubusercontent.com
+export NO_PROXY=localhost,127.0.0.1,::1,github.com,.github.com,api.github.com,githubusercontent.com,.githubusercontent.com,ghcr.io,.ghcr.io,auth.docker.io
+export no_proxy=localhost,127.0.0.1,::1,github.com,.github.com,api.github.com,githubusercontent.com,.githubusercontent.com,ghcr.io,.ghcr.io,auth.docker.io
 codex
 ```
 
@@ -398,7 +624,8 @@ Then start Codex from another terminal with the proxy and CA bundle:
 export HTTPS_PROXY=http://127.0.0.1:8080
 export HTTP_PROXY=http://127.0.0.1:8080
 export SSL_CERT_FILE=/Users/macos/Projects/2080/ai-proxy/certs/ai-proxy-ca.pem
-export NO_PROXY=github.com,api.github.com,githubusercontent.com
+export NO_PROXY=localhost,127.0.0.1,::1,github.com,.github.com,api.github.com,githubusercontent.com,.githubusercontent.com,ghcr.io,.ghcr.io,auth.docker.io
+export no_proxy=localhost,127.0.0.1,::1,github.com,.github.com,api.github.com,githubusercontent.com,.githubusercontent.com,ghcr.io,.ghcr.io,auth.docker.io
 codex
 ```
 
@@ -414,10 +641,11 @@ Create or edit `~/.codex/.env`:
 HTTPS_PROXY=http://127.0.0.1:8080
 HTTP_PROXY=http://127.0.0.1:8080
 SSL_CERT_FILE=/Users/macos/Projects/2080/ai-proxy/certs/ai-proxy-ca.pem
-NO_PROXY=github.com,api.github.com,githubusercontent.com
+NO_PROXY=localhost,127.0.0.1,::1,github.com,.github.com,api.github.com,githubusercontent.com,.githubusercontent.com,ghcr.io,.ghcr.io,auth.docker.io
+no_proxy=localhost,127.0.0.1,::1,github.com,.github.com,api.github.com,githubusercontent.com,.githubusercontent.com,ghcr.io,.ghcr.io,auth.docker.io
 ```
 
-After that, `codex` can be started without per-shell exports. Codex filters `CODEX_` variables from this dotenv file, so set `CODEX_HOME` in the OS shell or service manager if you need a non-default Codex home. The dotenv values become normal process environment variables, so subprocesses launched by Codex inherit them. `NO_PROXY` keeps GitHub tooling from being sent through the MITM proxy and avoids certificate trust failures in tools that do not use `SSL_CERT_FILE`.
+After that, `codex` can be started without per-shell exports. Codex filters `CODEX_` variables from this dotenv file, so set `CODEX_HOME` in the OS shell or service manager if you need a non-default Codex home. The dotenv values become normal process environment variables, so subprocesses launched by Codex inherit them. `NO_PROXY`/`no_proxy` keeps GitHub tooling, Homebrew downloads, and GitHub Container Registry pulls from being sent through the MITM proxy and avoids certificate trust failures in tools that do not use `SSL_CERT_FILE`.
 
 ### GitHub CLI and Proxy Inheritance
 
@@ -427,10 +655,12 @@ managers, and test runners inherit those variables. That is useful for AI client
 traffic, but it can accidentally route unrelated HTTPS traffic through the MITM
 proxy.
 
-Keep GitHub in `NO_PROXY` unless you explicitly want to inspect GitHub traffic:
+Keep GitHub, `ghcr.io`, and `auth.docker.io` in `NO_PROXY` unless you explicitly
+want to inspect GitHub or Docker registry auth traffic:
 
 ```dotenv
-NO_PROXY=github.com,api.github.com,githubusercontent.com
+NO_PROXY=localhost,127.0.0.1,::1,github.com,.github.com,api.github.com,githubusercontent.com,.githubusercontent.com,ghcr.io,.ghcr.io,auth.docker.io
+no_proxy=localhost,127.0.0.1,::1,github.com,.github.com,api.github.com,githubusercontent.com,.githubusercontent.com,ghcr.io,.ghcr.io,auth.docker.io
 ```
 
 To confirm what a command will use, run:
@@ -473,11 +703,13 @@ RUST_LOG=debug cargo run   # verbose: see scan pipeline details
 RUST_LOG=trace cargo run   # very verbose: see individual matches
 ```
 
-Each redaction is logged as a structured event:
+Each redaction is logged as a structured event with scanner, category, confidence, lengths, and byte ranges only:
 
 ```
-INFO Secret redacted scanner=regex pattern=aws_access_key original_len=20 redacted_to="AKI***...***PLE"
+INFO Secret redacted scanner=regex pattern=aws_access_key category=api_key original_len=20 replacement_len=13
 ```
+
+Logs must not contain raw prompts, auth headers, cookies, tool arguments, tool output bodies, model scanner prompts, raw model scanner responses, or original sensitive values.
 
 Set `AI_PROXY_LOGGING_ENABLED=false` to skip tracing subscriber initialization.
 

@@ -123,13 +123,14 @@ impl SecretScanner for EntropyScanner {
                     entropy = entropy,
                     "High-entropy token near keyword detected"
                 );
-                matches.push(ScanMatch {
-                    value: token.to_string(),
-                    scanner: "entropy".to_string(),
-                    pattern_name: "high_entropy_near_keyword".to_string(),
-                    start: pos,
-                    end: pos + token.len(),
-                });
+                matches.push(ScanMatch::new(
+                    token.to_string(),
+                    "entropy",
+                    "high_entropy_near_keyword",
+                    pos,
+                    pos + token.len(),
+                    0.70,
+                ));
             }
         }
 

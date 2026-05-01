@@ -16,11 +16,25 @@ mitm_cert_cache_size = 256
 mitm_excluded_hosts = []
 websocket_mode = "inspect"                       # reject | passthrough | inspect
 
+[dashboard]
+enabled = false
+listen_addr = "127.0.0.1:18081"                  # loopback only; use ssh -L for remote access
+sqlite_path = "ai-proxy-telemetry.sqlite"
+retention_hours = 24
+
+[dashboard.capture]
+prompts = false
+responses = false
+max_body_bytes = 8192
+redact_before_store = true
+
 [redaction]
 strategy = "partial"
 prefix_len = 3
 suffix_len = 3
 mask = "***...***"
+response_restore_enabled = false
+restorable_categories = ["email", "person_name", "phone"]
 
 [scanner]
 enabled = false
@@ -32,6 +46,36 @@ header_whitelist = [
     "anthropic-version",
     "anthropic-beta",
 ]
+
+[scanner.model]
+enabled = false
+mode = "hybrid"                    # hybrid | verify_only | direct
+endpoint = "http://127.0.0.1:11434/v1/chat/completions"
+model = "llama3.1"
+timeout_ms = 750
+max_chars = 8192
+fail_policy = "regex_only"         # regex_only | fail_closed
+categories = ["email", "person_name", "phone"]
+
+[scanner.privacy_filter]
+enabled = false
+endpoint = "http://127.0.0.1:18082/scan"         # local adapter for OpenAI Privacy Filter
+command = ""                                     # alternatively: "opf" to run the local CLI with --format json
+command_args = []                                # example: ["--device", "cpu", "--no-print-color-coded-text"]
+timeout_ms = 750
+max_chars = 8192
+fail_policy = "regex_only"                      # regex_only | fail_closed
+categories = [
+    "private_person",
+    "private_email",
+    "private_phone",
+    "private_address",
+    "private_url",
+    "private_date",
+    "account_number",
+    "secret",
+]
+min_confidence = 0.70
 
 [scanner.entropy]
 enabled = true
@@ -69,6 +113,10 @@ pattern = "sk-ant-[A-Za-z0-9-]{20,}"
 [[scanner.regex.patterns]]
 name = "openai_api_key"
 pattern = "sk-[A-Za-z0-9]{20,}"
+
+[[scanner.regex.patterns]]
+name = "email"
+pattern = "[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\\.[A-Za-z]{2,}"
 
 [[scanner.regex.patterns]]
 name = "generic_secret_assignment"
