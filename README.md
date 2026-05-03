@@ -217,6 +217,7 @@ mitm_ca_cert_path = "certs/ai-proxy-ca.pem"
 mitm_ca_key_path = "certs/ai-proxy-ca-key.pem"
 mitm_cert_cache_size = 256
 mitm_excluded_hosts = []              # hostnames that should keep blind CONNECT tunneling
+mitm_included_hosts = []              # optional allowlist for MITM; empty means inspect all non-excluded hosts
 websocket_mode = "inspect"            # reject | passthrough | inspect; default inspect
 ```
 
@@ -507,6 +508,7 @@ AI_PROXY_MITM_CA_CERT_PATH=certs/ai-proxy-ca.pem
 AI_PROXY_MITM_CA_KEY_PATH=certs/ai-proxy-ca-key.pem
 AI_PROXY_MITM_CERT_CACHE_SIZE=256
 AI_PROXY_MITM_EXCLUDED_HOSTS=example.com,internal.example
+AI_PROXY_MITM_INCLUDED_HOSTS=chatgpt.com,.chatgpt.com,api.openai.com,api.anthropic.com
 AI_PROXY_WEBSOCKET_MODE=inspect
 AI_PROXY_DASHBOARD_ENABLED=false
 AI_PROXY_DASHBOARD_AUTH_ENABLED=true
@@ -627,6 +629,7 @@ mitm_enabled = true
 mitm_ca_cert_path = "certs/ai-proxy-ca.pem"
 mitm_ca_key_path = "certs/ai-proxy-ca-key.pem"
 mitm_excluded_hosts = ["example.com"]
+mitm_included_hosts = ["chatgpt.com", ".chatgpt.com", "api.openai.com", "api.anthropic.com"]
 websocket_mode = "inspect"
 ```
 
@@ -706,7 +709,7 @@ openai_base_url = "http://127.0.0.1:8080/v1"
 
 For ChatGPT subscription mode, prefer the `~/.codex/.env` proxy setup above so Codex's `chatgpt.com` traffic goes through MITM inspection.
 
-When MITM is enabled and a host is not listed in `mitm_excluded_hosts`, CONNECT traffic is decrypted locally, request bodies are scanned/redacted, and the request is forwarded upstream over HTTPS. Hosts in `mitm_excluded_hosts` continue to use blind CONNECT tunneling.
+When MITM is enabled and `mitm_included_hosts` is empty, every host not listed in `mitm_excluded_hosts` is decrypted locally, request bodies are scanned/redacted, and the request is forwarded upstream over HTTPS. When `mitm_included_hosts` is set, only matching hosts are decrypted and all other CONNECT traffic uses blind tunneling. A leading dot matches subdomains, for example `.chatgpt.com` matches `ab.chatgpt.com`.
 
 `websocket_mode` controls WebSocket upgrades inside MITM sessions:
 

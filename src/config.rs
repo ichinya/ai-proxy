@@ -46,6 +46,8 @@ pub struct ProxyConfig {
     pub mitm_cert_cache_size: usize,
     #[serde(default)]
     pub mitm_excluded_hosts: Vec<String>,
+    #[serde(default)]
+    pub mitm_included_hosts: Vec<String>,
     #[serde(default = "default_websocket_mode")]
     pub websocket_mode: String,
 }
@@ -345,6 +347,7 @@ impl Config {
             mitm_enabled = config.proxy.mitm_enabled,
             mitm_cert_cache_size = config.proxy.mitm_cert_cache_size,
             mitm_excluded_hosts = config.proxy.mitm_excluded_hosts.len(),
+            mitm_included_hosts = config.proxy.mitm_included_hosts.len(),
             websocket_mode = %config.proxy.websocket_mode,
             dashboard_enabled = config.dashboard.enabled,
             dashboard_auth_enabled = config.dashboard.auth_enabled,
@@ -410,6 +413,10 @@ impl Config {
         override_string_list(
             "AI_PROXY_MITM_EXCLUDED_HOSTS",
             &mut self.proxy.mitm_excluded_hosts,
+        );
+        override_string_list(
+            "AI_PROXY_MITM_INCLUDED_HOSTS",
+            &mut self.proxy.mitm_included_hosts,
         );
         override_string("AI_PROXY_WEBSOCKET_MODE", &mut self.proxy.websocket_mode);
         override_bool("AI_PROXY_DASHBOARD_ENABLED", &mut self.dashboard.enabled)?;
@@ -914,6 +921,7 @@ mod tests {
                 mitm_ca_key_path: None,
                 mitm_cert_cache_size: default_mitm_cert_cache_size(),
                 mitm_excluded_hosts: Vec::new(),
+                mitm_included_hosts: Vec::new(),
                 websocket_mode: default_websocket_mode(),
             },
             dashboard: DashboardConfig {

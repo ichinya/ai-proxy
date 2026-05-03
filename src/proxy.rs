@@ -142,6 +142,7 @@ async fn handle_connect(state: Arc<AppState>, req: Request<Body>) -> Result<Resp
     };
     let use_mitm = state.config.proxy.mitm_enabled
         && state.mitm_authority.is_some()
+        && is_mitm_included_host(&state, &host)
         && !is_mitm_excluded_host(&state, &host);
 
     info!(target = %authority, host = %host, mitm = use_mitm, "CONNECT tunnel requested");
@@ -1034,6 +1035,16 @@ mod tests {
     }
 
     #[test]
+    fn host_pattern_matching_supports_exact_and_subdomain_patterns() {
+        assert!(host_matches_pattern("chatgpt.com", "chatgpt.com"));
+        assert!(host_matches_pattern("abc.chatgpt.com", ".chatgpt.com"));
+        assert!(host_matches_pattern("ABC.ChatGPT.Com.", ".chatgpt.com"));
+        assert!(!host_matches_pattern("chatgpt.com", ".chatgpt.com"));
+        assert!(!host_matches_pattern("notchatgpt.com", ".chatgpt.com"));
+        assert!(!host_matches_pattern("chatgpt.com", ""));
+    }
+
+    #[test]
     fn build_upstream_url_preserves_absolute_proxy_uri() {
         let uri: Uri = "http://127.0.0.1:5180/index.html?x=1".parse().unwrap();
 
@@ -1076,7 +1087,32 @@ fn is_mitm_excluded_host(state: &AppState, host: &str) -> bool {
         .proxy
         .mitm_excluded_hosts
         .iter()
-        .any(|excluded| excluded.eq_ignore_ascii_case(host))
+        .any(|excluded| host_matches_pattern(host, excluded))
+}
+
+fn is_mitm_included_host(state: &AppState, host: &str) -> bool {
+    let included_hosts = &state.config.proxy.mitm_included_hosts;
+    included_hosts.is_empty()
+        || included_hosts
+            .iter()
+            .any(|included| host_matches_pattern(host, included))
+}
+
+fn host_matches_pattern(host: &str, pattern: &str) -> bool {
+    let host = host.trim().trim_end_matches('.').to_ascii_lowercase();
+    let pattern = pattern.trim().trim_end_matches('.').to_ascii_lowercase();
+    if host.is_empty() || pattern.is_empty() {
+        return false;
+    }
+
+    if let Some(suffix) = pattern.strip_prefix('.') {
+        return !suffix.is_empty()
+            && host.len() > suffix.len() + 1
+            && host.ends_with(suffix)
+            && host.as_bytes()[host.len() - suffix.len() - 1] == b'.';
+    }
+
+    host == pattern
 }
 
 fn log_connect_tunnel_error(target: &str, error: &std::io::Error) {

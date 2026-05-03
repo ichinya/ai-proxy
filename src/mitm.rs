@@ -5,7 +5,7 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 use rcgen::{
-    BasicConstraints, Certificate, CertificateParams, DistinguishedName, DnType, IsCa, KeyPair,
+    BasicConstraints, CertificateParams, DistinguishedName, DnType, IsCa, Issuer, KeyPair,
     KeyUsagePurpose,
 };
 use rustls::ServerConfig;
@@ -18,8 +18,7 @@ use crate::config::ProxyConfig;
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
 pub struct MitmAuthority {
-    ca_certificate: Certificate,
-    ca_key_pair: KeyPair,
+    ca_issuer: Issuer<'static, KeyPair>,
     cache_size: usize,
     cert_cache: Mutex<CertificateCache>,
 }
@@ -94,14 +93,12 @@ impl MitmAuthority {
         let cert_pem = fs::read_to_string(cert_path)?;
         let key_pem = fs::read_to_string(key_path)?;
         let key_pair = KeyPair::from_pem(&key_pem)?;
-        let ca_params = CertificateParams::from_ca_cert_pem(&cert_pem)?;
-        let ca_certificate = ca_params.self_signed(&key_pair)?;
+        let ca_issuer = Issuer::from_ca_cert_pem(&cert_pem, key_pair)?;
 
         info!("MITM certificate authority loaded");
 
         Ok(Self {
-            ca_certificate,
-            ca_key_pair: key_pair,
+            ca_issuer,
             cache_size,
             cert_cache: Mutex::new(CertificateCache::new()),
         })
@@ -139,7 +136,7 @@ impl MitmAuthority {
         params.distinguished_name = distinguished_name;
 
         let leaf_key_pair = KeyPair::generate()?;
-        let cert = params.signed_by(&leaf_key_pair, &self.ca_certificate, &self.ca_key_pair)?;
+        let cert = params.signed_by(&leaf_key_pair, &self.ca_issuer)?;
         let key_der = leaf_key_pair.serialize_der();
 
         let cert_chain = vec![CertificateDer::from(cert.der().to_vec())];
